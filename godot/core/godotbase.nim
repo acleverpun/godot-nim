@@ -1,8 +1,9 @@
 # Copyright (c) 2017 Xored Software, Inc.
 
+import math
+
 type
-  Error* {.importc: "godot_error", header: "godot/gdnative.h",
-           size: sizeof(cint), pure.} = enum
+  Error* {.size: sizeof(cint), pure.} = enum
     OK,
     Failed,    ## Generic fail error
     Unavailable,    ## What is requested is unsupported/unavailable
@@ -56,52 +57,74 @@ type
     PrinterOnFire, ## the parallel port printer is engulfed in flames
     WTF ## shit happens, has never been used, though
 
-const MAX_ARG_COUNT* = 128
+# math helpers
+
+const EPSILON = 0.00001'f32
+proc isEqualApprox*(a, b: float32): bool {.inline.}  =
+  abs(a - b) < EPSILON
+
+proc isEqualApprox*(a, b: float64): bool {.inline.} =
+  abs(a - b) < EPSILON
+
+proc sign*(a: float32): float32 {.inline.} =
+  if a < 0: -1.0'f32 else: 1.0'f32
+
+proc sign*(a: float64): float64 {.inline.} =
+  if a < 0: -1.0'f64 else: 1.0'f64
+
+proc stepify*(value, step: float64): float64 =
+  if step != 0'f64:
+    floor(value / step + 0.5'f64) * step
+  else:
+    value
+
+proc stepify*(value, step: float32): float32 =
+  if step != 0'f32:
+    floor(value / step + 0.5'f32) * step
+  else:
+    value
+
+import "../internal/godotinternaltypes.nim"
 
 type
-  GodotObject* {.importc: "godot_object", header: "godot/gdnative.h".} = object
-  Array* {.importc: "godot_array", header: "godot/array.h", byref.} = object
-  Variant* {.importc: "godot_variant",
-             header: "godot/variant.h", byref.} = object
+  Variant* = ref object
+    godotVariant: GodotVariant
+    noDeinit: bool # used to avoid copying when passing the variant to Godot
 
-proc initArray(dest: var Array, src: Array) {.
-    importc: "godot_array_new_copy",
-    header: "godot/array.h".}
+  Array* = ref object
+    godotArray: GodotArray
 
-proc deinit(self: var Array) {.importc: "godot_array_destroy",
-    header: "godot/array.h".}
+proc markNoDeinit*(v: Variant) {.inline.} =
+  ## Makes it so that internal GodotVariant object will not be destroyed
+  ## when the reference is gone. Use only if you know what you are doing.
+  v.noDeinit = true
 
-proc `=`(self: var Array, other: Array) {.inline.} =
-  initArray(self, other)
+proc isNoDeinit*(v: Variant): bool {.inline.} =
+  v.noDeinit
 
-proc `=destroy`(self: Array) {.inline.} =
-  unsafeAddr(self).deinit()
+proc godotArray*(arr: Array): ptr GodotArray {.inline.} =
+  ## WARNING: do not keep the returned value for longer than the lifetime of
+  ## ``arr``
+  addr arr.godotArray
 
-proc initVariant(dest: var Variant; src: Variant) {.
-    importc: "godot_variant_new_copy", header: "godot/variant.h".}
-
-proc deinit*(self: var Variant) {.
-    importc: "godot_variant_destroy", header: "godot/variant.h".}
-
-proc `=`(self: var Variant, other: Variant) {.inline.} =
-  initVariant(self, other)
-
-proc `=destroy`(self: Variant) {.inline.} =
-  unsafeAddr(self).deinit()
+proc godotVariant*(v: Variant): ptr GodotVariant {.inline.} =
+  ## WARNING: do not keep the returned value for longer than the lifetime of
+  ## ``v``
+  addr v.godotVariant
 
 # System Functions
 
 proc godotAlloc*(bytes: cint): pointer {.
-  importc: "godot_alloc", header: "godot/gdnative.h".}
+  importc: "godot_alloc".}
   ## Allocates the specified number of bytes.
   ## Using this instead of stdlib proc will help Godot track how much memory
   ## is in use in debug mode.
 proc godotRealloc*(p: pointer; bytes: cint): pointer {.
-  importc: "godot_realloc", header: "godot/gdnative.h".}
+  importc: "godot_realloc".}
   ## Reallocates the pointer for the specified number of bytes.
   ## Using this instead of stdlib proc will help Godot track how much memory
   ## is in use in debug mode.
-proc godotFree*(p: pointer) {.importc: "godot_free", header: "godot/gdnative.h".}
+proc godotFree*(p: pointer) {.importc: "godot_free".}
   ## Frees the memory pointed to by the pointer.
   ## Using this instead of stdlib proc will help Godot track how much memory
   ## is in use in debug mode.

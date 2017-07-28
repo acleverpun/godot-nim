@@ -1,13 +1,14 @@
 # Copyright 2017 Xored Software, Inc.
 
 import tables, typetraits, macros
-import "../core/godotbase.nim", "../core/godotcore.nim"
-import "../core/strings.nim", "../core/vector2.nim", "../core/rect2.nim",
+import "../core/godotbase.nim"
+import "../core/vector2.nim", "../core/rect2.nim",
        "../core/vector3.nim", "../core/transform2d.nim",
-       "../core/plane.nim", "../core/quat.nim", "../core/rect3.nim",
-       "../core/basis.nim", "../core/transform.nim", "../core/color.nim",
-       "../core/nodepath.nim", "../core/rid.nim", "../core/dictionary.nim",
-       "../core/arrays.nim", "../core/poolarray.nim", "../core/variant.nim"
+       "../core/planes.nim", "../core/quats.nim", "../core/rect3.nim",
+       "../core/basis.nim", "../core/transforms.nim", "../core/colors.nim",
+       "../core/nodepaths.nim", "../core/rids.nim", "../core/dictionaries.nim",
+       "../core/arrays.nim", "../core/poolarrays.nim", "../core/variants.nim"
+import "../godotinternal.nim"
 
 ## Definition of NimGodotObject and converters for built-in types.
 
@@ -48,23 +49,36 @@ type
     isNative: bool
     isRef: bool
 
+template printWarning*(warn: typed) =
+  let (filename, line) = instantiationInfo()
+  godotPrintWarning(cstring($warn), nil, cstring(filename), line.cint)
+
+template printError*(err: typed) =
+  let (filename, line) = instantiationInfo()
+  godotPrintError(cstring($err), nil, cstring(filename), line.cint)
+
+proc print*(message: string) {.inline.} =
+  var s = message.toGodotString()
+  godotPrint(s)
+  s.deinit()
+
+proc print*(message: cstring) {.inline.} =
+  var s = message.toGodotString()
+  godotPrint(s)
+  s.deinit()
+
 var classRegistry {.threadvar.}: TableRef[cstring, ObjectInfo]
+var classRegistryStatic {.compileTime.}: TableRef[cstring, ObjectInfo]
+static:
+  classRegistryStatic = newTable[cstring, ObjectInfo]()
 
 static:
   import sets, strutils
 var nativeClasses {.compileTime.} = newSeq[string]()
 var refClasses* {.compileTime.} = newSeq[string]()
 
-var getClassMethodBind {.threadvar.}: ptr GodotMethodBind
-proc getClassName*(o: ptr GodotObject): string =
-  if getClassMethodBind.isNil:
-    getClassMethodBind = getMethod(cstring"Object", cstring"get_class")
-  var ret: GodotString
-  getClassMethodBind.ptrCall(o, nil, addr ret)
-  result = $ret
-  if result.endsWith("SW"):
-    # There are physics type not known by ClassDB
-    result = result[0..result.len-3]
+proc getClassName*(o: NimGodotObject): string =
+  o.godotObject.getClassName()
 
 var unreferenceMethodBind {.threadvar.}: ptr GodotMethodBind
 proc unreference(o: ptr GodotObject): bool =
@@ -137,12 +151,20 @@ template registerClass*(T: typedesc; godotClassName: cstring,
 
   const base = baseNativeType(T)
   const isRef: bool = isReference(T)
-  classRegistry[godotClassName] = ObjectInfo(
+  let objInfo = ObjectInfo(
     constructor: constructor,
     baseNativeClass: base,
     isNative: isNativeParam,
     isRef: isRef
   )
+  classRegistry[godotClassName] = objInfo
+  static:
+    let objInfoStatic = ObjectInfo(
+      baseNativeClass: base,
+      isNative: isNativeParam,
+      isRef: isRef
+    )
+    classRegistryStatic[godotClassName] = objInfoStatic
   when isRef:
     static:
       refClasses.add(T.name)
@@ -176,6 +198,15 @@ proc asNimGodotObject*[T: NimGodotObject](godotObject: ptr GodotObject): T =
     result = newNimGodotObject[T](
       godotObject, cstring(godotObject.getClassName()))
 
+proc newVariant*(obj: NimGodotObject): Variant {.inline.} =
+  newVariant(obj.godotObject)
+
+proc asObject*[T: NimGodotObject](v: Variant): T {.inline.} =
+  asNimGodotObject[T](v.asGodotObject())
+
+proc asObject*(v: Variant, T: typedesc[NimGodotObject]): T {.inline.} =
+  asNimGodotObject[T](v.asGodotObject())
+
 proc `as`*[T: NimGodotObject](obj: NimGodotObject, t: typedesc[T]): T =
   ## Converts the ``obj`` into the specified type.
   ## Returns ``nil`` if the conversion cannot be performed
@@ -190,7 +221,7 @@ proc `as`*[T: NimGodotObject](obj: NimGodotObject, t: typedesc[T]): T =
     result = T(obj)
 
 proc getSingletonGodot*(name: cstring): ptr GodotObject {.
-    importc: "godot_global_get_singleton", header: "godot/gdnative.h".}
+    importc: "godot_global_get_singleton".}
 
 proc newRStrLit(s: string): NimNode {.compileTime.} =
   result = newNimNode(nnkRStrLit)
@@ -217,12 +248,48 @@ proc getSingleton*[T: NimGodotObject](): T =
   else:
     result = asNimGodotObject[T](singleton)
 
+var gdNativeLibraryObj: ptr GodotObject
+
+var setClassNameMethod: ptr GodotMethodBind
+var setLibraryMethod: ptr GodotMethodBind
+var newMethod: ptr GodotMethodBind
+type
+  PtrCallArgType = ptr array[MAX_ARG_COUNT, pointer]
+proc newOwnObj[T: NimGodotObject](name: cstring): T =
+  let newNativeScript = getClassConstructor(cstring"NativeScript")()
+  if setClassNameMethod.isNil:
+    setClassNameMethod =
+      getMethod(cstring"NativeScript", cstring"set_class_name")
+  if setLibraryMethod.isNil:
+    setLibraryMethod =
+      getMethod(cstring"NativeScript", cstring"set_library")
+  if newMethod.isNil:
+    newMethod = getMethod(cstring"NativeScript", cstring"new")
+  var godotStrName = name.toGodotString()
+  var argPtr: pointer = addr godotStrName
+  setClassNameMethod.ptrCall(
+    newNativeScript, cast[PtrCallArgType](addr argPtr), nil)
+  deinit(godotStrName)
+  setLibraryMethod.ptrCall(
+    newNativeScript, cast[PtrCallArgType](addr gdNativeLibraryObj), nil)
+
+  var err: VariantCallError
+  var ret = newMethod.call(newNativeScript, nil, 0, err)
+  if err.error != VariantCallErrorType.OK:
+    printError("Failed to invoke 'new' on NativeScript for " & $name)
+  elif ret.getType() != VariantType.Object:
+    printError("Expected that NativeScript::new returns Object, " &
+               "but it returned: " & $ret.getType())
+  else:
+    result = asNimGodotObject[T](ret.asGodotObject())
+  ret.deinit()
+
 proc gdnew*[T: NimGodotObject](): T =
   const godotName = toGodotName(T)
-  let obj = godotNew(godotName)
-  if obj.isNil:
-    printError("godot_new returned nil for type " & $godotName)
-  result = asNimGodotObject[T](obj)
+  const objInfo = classRegistryStatic[godotName]
+  result = when objInfo.isNative:
+             asNimGodotObject[T](getClassConstructor(godotName)())
+           else: newOwnObj[T](godotName)
 
 proc newCallError*(err: VariantCallError): ref CallError =
   let msg = case err.error:
@@ -250,7 +317,7 @@ proc newConversionError*(err: ConversionResult): ref ValueError =
 
   result = newException(ValueError, msg)
 
-proc removeGodotObject*(nimObj: NimGodotObject) =
+proc removeGodotObject*(nimObj: NimGodotObject) {.inline.} =
   ## Used from destructor
   nimObj.godotObject = nil
 
@@ -269,12 +336,12 @@ proc godotVariantType*(T: typedesc[NimGodotObject]): VariantType {.inline.} =
   VariantType.Object
 
 proc toGodot*(self: NimGodotObject): Variant {.inline.} =
-  variant(self.godotObject)
+  newVariant(self.godotObject)
 
 proc fromGodot*[T: NimGodotObject](self: var T,
                                    val: Variant): ConversionResult =
   if val.getType() == VariantType.Object:
-    let objPtr = val.asObject()
+    let objPtr = val.asGodotObject()
     self = asNimGodotObject[T](objPtr)
     if self.isNil:
       result = ConversionResult.TypeError
@@ -287,19 +354,21 @@ proc godotVariantType*(T: typedesc[enum]): VariantType {.inline.} =
   VariantType.Int
 
 proc toGodot*[T: enum](self: T): Variant {.inline.} =
-  variant(int64(ord(self)))
+  newVariant(int64(ord(self)))
 
-proc fromGodot*[T: enum](self: var T, val: Variant): ConversionResult =
+proc fromGodot*[T: enum](self: var T,
+                         val: Variant): ConversionResult {.inline.} =
   if val.getType() == VariantType.Int:
     self = T(val.asInt())
   else:
     result = ConversionResult.TypeError
 
 proc toGodot*(self: Variant): Variant {.inline.} =
-  result = self
+  self
 
-proc fromGodot*(self: var Variant, val: Variant): ConversionResult {.inline.} =
-  self = val
+proc fromGodot*(self: var Variant,
+                val: Variant): ConversionResult {.inline.} =
+  self = newVariant(val)
 
 proc godotVariantType*(T: typedesc[SomeGodotOrNum]): VariantType {.inline.} =
   when T is SomeSignedInt or T is SomeUnsignedInt:
@@ -330,12 +399,12 @@ proc godotVariantType*(T: typedesc[SomeGodotOrNum]): VariantType {.inline.} =
     VariantType.Transform
   elif T is Color:
     VariantType.Color
-  elif T is NodePath:
-    VariantType.NodePath
   elif T is RID:
     VariantType.RID
-  elif T is GodotObject:
+  elif T is ptr GodotObject:
     VariantType.Object
+  elif T is NodePath:
+    VariantType.NodePath
   elif T is Dictionary:
     VariantType.Dictionary
   elif T is Array:
@@ -358,7 +427,7 @@ proc godotVariantType*(T: typedesc[SomeGodotOrNum]): VariantType {.inline.} =
     VariantType.Nil
 
 proc toGodot*[T: SomeGodotOrNum](val: T): Variant {.inline.} =
-  result = variant(val)
+  newVariant(val)
 
 proc fromGodot*[T: SomeSignedInt or SomeUnsignedInt](
     self: var T, val: Variant): ConversionResult =
@@ -376,7 +445,7 @@ proc fromGodot*[T: SomeSignedInt or SomeUnsignedInt](
 
 proc fromGodot*[T: SomeFloat](self: var T, val: Variant): ConversionResult =
   if val.getType() == VariantType.Real:
-    self = val.asReal()
+    self = T(val.asReal())
   elif val.getType() == VariantType.Int:
     self = T(val.asInt())
   else:
@@ -441,13 +510,15 @@ proc godotVariantType*(T: typedesc[string]): VariantType  {.inline.} =
   VariantType.String
 
 proc toGodot*(s: string): Variant {.inline.} =
-  variant(s.toGodotString())
+  newVariant(s)
 
 proc fromGodot*(s: var string, val: Variant): ConversionResult =
-  if val.getType() != VariantType.String:
-    result = ConversionResult.TypeError
+  if val.getType() == VariantType.String:
+    s = val.asString()
+  elif val.getType() == VariantType.Nil:
+    s = nil
   else:
-    s = $val.asGodotString()
+    result = ConversionResult.TypeError
 
 proc godotVariantType*(T: typedesc[seq]): VariantType =
   VariantType.Array
@@ -456,11 +527,11 @@ proc godotVariantType*(T: typedesc[array]): VariantType =
   VariantType.Array
 
 proc toGodot*[T](s: openarray[T]): Variant =
-  var arr = initArray()
+  var arr = newArray()
   mixin toGodot
   for item in s:
     arr.add(toGodot(item))
-  result = variant(arr)
+  result = newVariant(arr)
 
 proc fromGodot*[T](s: var seq[T], val: Variant): ConversionResult =
   if val.getType() != VariantType.Array:
@@ -492,11 +563,11 @@ proc godotVariantType*(T: typedesc[Table|TableRef]): VariantType {.inline.} =
   VariantType.Dictionary
 
 proc toGodot*[T: Table or TableRef](t: T): Variant =
-  var dict = initDictionary()
+  var dict = newDictionary()
   mixin toGodot
   for k, v in t.pairs():
     dict[toGodot(k)] = toGodot(v)
-  result = variant(dict)
+  result = newVariant(dict)
 
 proc fromGodot*[T: Table or TableRef](t: var T, val: Variant): ConversionResult =
   if val.getType() != VariantType.Dictionary:
@@ -559,11 +630,11 @@ proc godot_nativescript_init(handle: pointer) {.
 
 proc godot_gdnative_init(options: ptr GodotNativeInitOptions) {.
     cdecl, exportc, dynlib.} =
-  discard
+  gdNativeLibraryObj = options.gdNativeLibrary
 
 proc godot_gdnative_terminate(options: ptr GodotNativeTerminateOptions) {.
     cdecl, exportc, dynlib.} =
-  deallocHeap(runFinalizers = false, allowGcAfterwards = false)
+  deallocHeap(runFinalizers = not options[].inEditor, allowGcAfterwards = false)
 
 proc godot_nativescript_thread_enter() {.
     cdecl, exportc, dynlib.} =
